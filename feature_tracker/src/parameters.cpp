@@ -38,6 +38,11 @@ void readParameters(ros::NodeHandle &n)
 {
     std::string config_file;
     config_file = readParam<std::string>(n, "config_file");
+    /**
+     * @brief 从yaml文件中读取数据
+     * 
+     * @return cv::FileStorage 
+     */
     cv::FileStorage fsSettings(config_file, cv::FileStorage::READ);
     if(!fsSettings.isOpened())
     {

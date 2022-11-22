@@ -24,7 +24,10 @@ bool inBorder(const cv::Point2f &pt);
 
 void reduceVector(vector<cv::Point2f> &v, vector<uchar> status);
 void reduceVector(vector<int> &v, vector<uchar> status);
-
+/**
+ * @brief FeatureTracker的类组成
+ * 
+ */
 class FeatureTracker
 {
   public:

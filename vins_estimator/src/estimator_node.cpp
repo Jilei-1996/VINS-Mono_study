@@ -76,9 +76,10 @@ void predict(const sensor_msgs::ImuConstPtr &imu_msg)
     acc_0 = linear_acceleration;
     gyr_0 = angular_velocity;
 }
-
+//这个函数在非线性优化时才会在process()中被调用
 void update()
 {
+    //从估计器中得到滑动窗口中最后一个图像帧的imu更新项[P,Q,V,ba,bg,a,g]
     TicToc t_predict;
     latest_time = current_time;
     tmp_P = estimator.Ps[WINDOW_SIZE];
@@ -88,7 +89,7 @@ void update()
     tmp_Bg = estimator.Bgs[WINDOW_SIZE];
     acc_0 = estimator.acc_0;
     gyr_0 = estimator.gyr_0;
-
+    //对imu_buf中剩余的imu_msg进行PVQ递推（因为imu的频率比图像频率要高很多，在getMeasurements(）将图像和imu时间对齐后，imu_buf中还会存在imu数据）
     queue<sensor_msgs::ImuConstPtr> tmp_imu_buf = imu_buf;
     for (sensor_msgs::ImuConstPtr tmp_imu_msg; !tmp_imu_buf.empty(); tmp_imu_buf.pop())
         predict(tmp_imu_buf.front());
@@ -102,16 +103,17 @@ getMeasurements()
 
     while (true)
     {
+         //直到把缓存中的图像特征数据或者IMU数据取完，才能够跳出此函数
         if (imu_buf.empty() || feature_buf.empty())
             return measurements;
-
+        //对齐标准：IMU最后一个数据的时间要大于第一个图像特征数据的时间
         if (!(imu_buf.back()->header.stamp.toSec() > feature_buf.front()->header.stamp.toSec() + estimator.td))
         {
             //ROS_WARN("wait for imu, only should happen at the beginning");
             sum_of_wait++;
             return measurements;
         }
-
+        //对齐标准：IMU第一个数据的时间要小于第一个图像特征数据的时间
         if (!(imu_buf.front()->header.stamp.toSec() < feature_buf.front()->header.stamp.toSec() + estimator.td))
         {
             ROS_WARN("throw img, only should happen at the beginning");
@@ -120,7 +122,7 @@ getMeasurements()
         }
         sensor_msgs::PointCloudConstPtr img_msg = feature_buf.front();
         feature_buf.pop();
-
+        //图像数据(img_msg)，对应多组在时间戳内的imu数据,然后塞入measurements
         std::vector<sensor_msgs::ImuConstPtr> IMUs;
         while (imu_buf.front()->header.stamp.toSec() < img_msg->header.stamp.toSec() + estimator.td)
         {
@@ -210,8 +212,10 @@ void process()
 {
     while (true)
     {
+        //将IMU数据和图像数据放到一起
         std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>> measurements;
         std::unique_lock<std::mutex> lk(m_buf);
+        //需要等待con.notify以及后边函数返回为true才会解除阻塞
         con.wait(lk, [&]
                  {
             return (measurements = getMeasurements()).size() != 0;
@@ -239,6 +243,7 @@ void process()
                     rx = imu_msg->angular_velocity.x;
                     ry = imu_msg->angular_velocity.y;
                     rz = imu_msg->angular_velocity.z;
+                    //processIMU()实现了IMU的预积分，通过中值积分得到当前PQV作为优化初值
                     estimator.processIMU(dt, Vector3d(dx, dy, dz), Vector3d(rx, ry, rz));
                     //printf("imu: dt:%f a: %f %f %f w: %f %f %f\n",dt, dx, dy, dz, rx, ry, rz);
 
@@ -263,7 +268,9 @@ void process()
                     //printf("dimu: dt:%f a: %f %f %f w: %f %f %f\n",dt_1, dx, dy, dz, rx, ry, rz);
                 }
             }
+
             // set relocalization frame
+            //在relo_buf中取出最后一个重定位帧，拿出其中的信息并执行setReloFrame()
             sensor_msgs::PointCloudConstPtr relo_msg = NULL;
             while (!relo_buf.empty())
             {
@@ -291,12 +298,14 @@ void process()
             }
 
             ROS_DEBUG("processing vision data with stamp %f \n", img_msg->header.stamp.toSec());
-
+            //建立每个特征点的(camera_id,[x,y,z,u,v,vx,vy])s的map，索引为feature_id
             TicToc t_s;
             map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> image;
+            //遍历img_msg里面的每一个特征点的归一化坐标
             for (unsigned int i = 0; i < img_msg->points.size(); i++)
             {
-                int v = img_msg->channels[0].values[i] + 0.5;
+                //把img的信息提取出俩放在image的容器里去
+                int v = img_msg->channels[0].values[i] + 0.5;//channels[0].values[i]==id_of_point
                 int feature_id = v / NUM_OF_CAM;
                 int camera_id = v % NUM_OF_CAM;
                 double x = img_msg->points[i].x;
@@ -311,6 +320,7 @@ void process()
                 xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
                 image[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
             }
+            //处理图像，这里实现了视觉与IMU的初始化以及非线性优化的紧耦合
             estimator.processImage(image, img_msg->header);
 
             double whole_t = t_s.toc();
@@ -328,6 +338,7 @@ void process()
                 pubRelocalization(estimator);
             //ROS_ERROR("end: %f, at %f", img_msg->header.stamp.toSec(), ros::Time::now().toSec());
         }
+        //更新IMU参数[P,Q,V,ba,bg,a,g]，注意线程安全
         m_estimator.unlock();
         m_buf.lock();
         m_state.lock();
@@ -349,16 +360,15 @@ int main(int argc, char **argv)
     ROS_DEBUG("EIGEN_DONT_PARALLELIZE");
 #endif
     ROS_WARN("waiting for image and imu...");
-
+    //发布用于RVIZ显示的Topic，本模块具体发布的内容详见输入输出
     registerPub(n);
-
+    //订阅IMU、feature、restart、match_points的topic，执行各自回调函数
     ros::Subscriber sub_imu = n.subscribe(IMU_TOPIC, 2000, imu_callback, ros::TransportHints().tcpNoDelay());
     ros::Subscriber sub_image = n.subscribe("/feature_tracker/feature", 2000, feature_callback);
     ros::Subscriber sub_restart = n.subscribe("/feature_tracker/restart", 2000, restart_callback);
     ros::Subscriber sub_relo_points = n.subscribe("/pose_graph/match_points", 2000, relocalization_callback);
-
+    //创建VIO主线程
     std::thread measurement_process{process};
     ros::spin();
-
     return 0;
 }
