@@ -84,6 +84,7 @@ void KeyFrame::computeWindowBRIEFPoint()
 	extractor(image, window_keypoints, window_brief_descriptors);
 }
 
+//额外检测新特征点并计算所有特征点的描述子，为了回环检测
 void KeyFrame::computeBRIEFPoint()
 {
 	BriefExtractor extractor(BRIEF_PATTERN_FILE.c_str());
@@ -117,7 +118,17 @@ void BriefExtractor::operator() (const cv::Mat &im, vector<cv::KeyPoint> &keys, 
   m_brief.compute(im, keys, descriptors);
 }
 
-
+/**
+ * @brief 实际上就是拿当前帧的当前点的描述子和回环帧的每一个点的描述子进行汉明距离的计算，选择最小距离的那个就OK了
+ * @param window_descriptor 
+ * @param descriptors_old 
+ * @param keypoints_old 
+ * @param keypoints_old_norm 
+ * @param best_match 
+ * @param best_match_norm 
+ * @return true 
+ * @return false 
+ */
 bool KeyFrame::searchInAera(const BRIEF::bitset window_descriptor,
                             const std::vector<BRIEF::bitset> &descriptors_old,
                             const std::vector<cv::KeyPoint> &keypoints_old,
@@ -149,6 +160,16 @@ bool KeyFrame::searchInAera(const BRIEF::bitset window_descriptor,
       return false;
 }
 
+/**
+ * @brief searchByBRIEFDes()干的事情就是对于当前帧的每一个特征点，都和回环帧的每一个特征点进行描述子匹配，
+ * 选择最接近的那一个，这样他俩就配对上了，它们就是同一个世界特征点在各自帧上的像素坐标。
+ * @param matched_2d_old 
+ * @param matched_2d_old_norm 
+ * @param status 
+ * @param descriptors_old 
+ * @param keypoints_old 
+ * @param keypoints_old_norm 
+ */
 void KeyFrame::searchByBRIEFDes(std::vector<cv::Point2f> &matched_2d_old,
 								std::vector<cv::Point2f> &matched_2d_old_norm,
                                 std::vector<uchar> &status,
@@ -197,6 +218,18 @@ void KeyFrame::FundmantalMatrixRANSAC(const std::vector<cv::Point2f> &matched_2d
     }
 }
 
+/**
+ * @brief PnPRANSAC()利用当前帧世界坐标系下的3D点和回环帧对应点的归一化坐标，求出回环帧在当前帧世界坐标系下的位姿，
+ * 首先把当前帧位姿从body->world系转到camera->world系下，作为回环帧位姿的初始估计：
+ * 然后调用OpenCV的函数，直接求出回环帧位姿
+ * 标记出利用PnP RANSAC去除outliner后，还有哪些点活着，然后会利用status去除outliers：
+ * 最后求出回环帧在当前帧的世界坐标系下的位姿，是body->world的表示：
+* @param matched_2d_old_norm 
+ * @param matched_3d 
+ * @param status 
+ * @param PnP_T_old 
+ * @param PnP_R_old 
+ */
 void KeyFrame::PnPRANSAC(const vector<cv::Point2f> &matched_2d_old_norm,
                          const std::vector<cv::Point3f> &matched_3d,
                          std::vector<uchar> &status,
@@ -205,6 +238,7 @@ void KeyFrame::PnPRANSAC(const vector<cv::Point2f> &matched_2d_old_norm,
 	//for (int i = 0; i < matched_3d.size(); i++)
 	//	printf("3d x: %f, y: %f, z: %f\n",matched_3d[i].x, matched_3d[i].y, matched_3d[i].z );
 	//printf("match size %d \n", matched_3d.size());
+    //首先把当前帧位姿从body->world系转到camera->world系下，作为回环帧位姿的初始估计：
     cv::Mat r, rvec, t, D, tmp_r;
     cv::Mat K = (cv::Mat_<double>(3, 3) << 1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0);
     Matrix3d R_inital;
@@ -219,6 +253,7 @@ void KeyFrame::PnPRANSAC(const vector<cv::Point2f> &matched_2d_old_norm,
     cv::Rodrigues(tmp_r, rvec);
     cv::eigen2cv(P_inital, t);
 
+    //然后调用OpenCV的函数，直接求出回环帧位姿：
     cv::Mat inliers;
     TicToc t_pnp_ransac;
 
@@ -233,6 +268,7 @@ void KeyFrame::PnPRANSAC(const vector<cv::Point2f> &matched_2d_old_norm,
 
     }
 
+    //标记出利用PnP RANSAC去除outliner后，还有哪些点活着，然后会利用status去除outliers：
     for (int i = 0; i < (int)matched_2d_old_norm.size(); i++)
         status.push_back(0);
 
@@ -242,6 +278,7 @@ void KeyFrame::PnPRANSAC(const vector<cv::Point2f> &matched_2d_old_norm,
         status[n] = 1;
     }
 
+    //最后求出回环帧在当前帧的世界坐标系下的位姿，是body->world的表示：
     cv::Rodrigues(rvec, r);
     Matrix3d R_pnp, R_w_c_old;
     cv::cv2eigen(r, R_pnp);
@@ -260,6 +297,12 @@ bool KeyFrame::findConnection(KeyFrame* old_kf)
 {
 	TicToc tmp_t;
 	//printf("find Connection\n");
+    //第一步：定义了一些用于保存当前帧和回环帧中具有对应关系的点的容器，
+    //名为cur的容器对应当前帧，old对应回环帧。
+    //matched_2d保存像素坐标，matched_2d_norm保存归一化坐标，matched_3d是3D点，
+    //注意，它们的3D坐标系是cur帧的世界坐标系，也就是位姿矫正前的世界坐标系。
+    //名为matched用于保存匹配成功的点的相关坐标，序号是一一对应的。
+ 
 	vector<cv::Point2f> matched_2d_cur, matched_2d_old;
 	vector<cv::Point2f> matched_2d_cur_norm, matched_2d_old_norm;
 	vector<cv::Point3f> matched_3d;
@@ -298,6 +341,7 @@ bool KeyFrame::findConnection(KeyFrame* old_kf)
 	    }
 	#endif
 	//printf("search by des\n");
+    //第二步，利用brief描述子找到当前帧和回环帧特征点的对应关系，然后去除匹配失败的点。
 	searchByBRIEFDes(matched_2d_old, matched_2d_old_norm, status, old_kf->brief_descriptors, old_kf->keypoints, old_kf->keypoints_norm);
 	reduceVector(matched_2d_cur, status);
 	reduceVector(matched_2d_old, status);
@@ -398,11 +442,13 @@ bool KeyFrame::findConnection(KeyFrame* old_kf)
 	        cv::imwrite( path.str().c_str(), loop_match_img);
 	    }
 	#endif
-	Eigen::Vector3d PnP_T_old;
-	Eigen::Matrix3d PnP_R_old;
-	Eigen::Vector3d relative_t;
-	Quaterniond relative_q;
-	double relative_yaw;
+	Eigen::Vector3d PnP_T_old;//回环帧在当前帧的世界坐标系下的位姿
+	Eigen::Matrix3d PnP_R_old;//回环帧在当前帧的世界坐标系下的位姿
+	Eigen::Vector3d relative_t;//回环帧和当前帧的相对平移变换
+	Quaterniond relative_q;//回环帧和当前帧的相对旋转变换
+	double relative_yaw;//回环帧和当前帧的相对旋转变换中的yaw角分量
+    //这块是RANSAC PnP去除误匹配，的确是的，但是除此之外，还求出两帧之间的相对位姿变换。
+    //但是，求出的这个相对位姿变换，最后并不是用来求r_drift和t_drift，而是用来求w_r_vio和w_t_vio的，所以这个相对位姿没有那么的重要。
 	if ((int)matched_2d_cur.size() > MIN_LOOP_NUM)
 	{
 		status.clear();
@@ -468,7 +514,8 @@ bool KeyFrame::findConnection(KeyFrame* old_kf)
 	        }
 	    #endif
 	}
-
+    //第四步，把相对位姿给到loop_info，注意了，此时loop_info保存的是当前帧与回环帧的相对位姿变换。
+    ////若达到最小回环匹配点数
 	if ((int)matched_2d_cur.size() > MIN_LOOP_NUM)
 	{
 	    relative_t = PnP_R_old.transpose() * (origin_vio_T - PnP_T_old);
@@ -477,6 +524,7 @@ bool KeyFrame::findConnection(KeyFrame* old_kf)
 	    //printf("PNP relative\n");
 	    //cout << "pnp relative_t " << relative_t.transpose() << endl;
 	    //cout << "pnp relative_yaw " << relative_yaw << endl;
+        //相对位姿检验
 	    if (abs(relative_yaw) < 30.0 && relative_t.norm() < 20.0)
 	    {
 
@@ -485,6 +533,7 @@ bool KeyFrame::findConnection(KeyFrame* old_kf)
 	    	loop_info << relative_t.x(), relative_t.y(), relative_t.z(),
 	    	             relative_q.w(), relative_q.x(), relative_q.y(), relative_q.z(),
 	    	             relative_yaw;
+            //快速重定位
 	    	if(FAST_RELOCALIZATION)
 	    	{
 			    sensor_msgs::PointCloud msg_match_points;
@@ -500,6 +549,7 @@ bool KeyFrame::findConnection(KeyFrame* old_kf)
 			    Eigen::Vector3d T = old_kf->T_w_i; 
 			    Eigen::Matrix3d R = old_kf->R_w_i;
 			    Quaterniond Q(R);
+                //把这些匹配点在回环帧上的坐标，回环帧的位姿(在他自己的世界坐标系下)发布出去，由vins_estimator订阅
 			    sensor_msgs::ChannelFloat32 t_q_index;
 			    t_q_index.values.push_back(T.x());
 			    t_q_index.values.push_back(T.y());

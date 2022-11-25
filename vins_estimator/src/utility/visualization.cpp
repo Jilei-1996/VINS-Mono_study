@@ -418,5 +418,5 @@ void pubRelocalization(const Estimator &estimator)
     odometry.twist.twist.linear.x = estimator.relo_relative_yaw;
     odometry.twist.twist.linear.y = estimator.relo_frame_index;
 
-    pub_relo_relative_pose.publish(odometry);
+    pub_relo_relative_pose.publish(odometry);//话题"relo_relative_pose"
 }

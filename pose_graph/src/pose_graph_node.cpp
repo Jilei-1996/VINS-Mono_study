@@ -22,7 +22,7 @@
 #include "utility/CameraPoseVisualization.h"
 #include "parameters.h"
 #define SKIP_FIRST_CNT 10
-using namespace std;
+using namespace std;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
 
 queue<sensor_msgs::ImageConstPtr> image_buf;
 queue<sensor_msgs::PointCloudConstPtr> point_buf;
@@ -66,6 +66,12 @@ CameraPoseVisualization cameraposevisual(1, 0, 0, 1);
 Eigen::Vector3d last_t(-100, -100, -100);
 double last_image_time = -1;
 
+/**
+ * @brief 它不仅会清空buffer里的数据，还会sequence++。
+ * 在这里，作者把一系列连续输入的帧作为一个sequence，如果数据中断了，那么就会创建一个新的sequence。
+ * 然后代码里只要找到机会(具有两个回环关系的两帧在不同的sequence里被发现了)，
+ * 那么他会把新sequence里的帧的位姿全部矫正到与旧sequence一致的坐标系里。
+ */
 void new_sequence()
 {
     printf("new sequence\n");
@@ -76,6 +82,7 @@ void new_sequence()
         ROS_WARN("only support 5 sequences since it's boring to copy code for more sequences.");
         ROS_BREAK();
     }
+    //重新初始化，重新构建地图。
     posegraph.posegraph_visualization->reset();
     posegraph.publish();
     m_buf.lock();
@@ -95,7 +102,7 @@ void image_callback(const sensor_msgs::ImageConstPtr &image_msg)
     //ROS_INFO("image_callback!");
     if(!LOOP_CLOSURE)
         return;
-    m_buf.lock();
+    m_buf.lock(); 
     image_buf.push(image_msg);
     m_buf.unlock();
     //printf(" image time %f \n", image_msg->header.stamp.toSec());
@@ -103,6 +110,7 @@ void image_callback(const sensor_msgs::ImageConstPtr &image_msg)
     // detect unstable camera stream
     if (last_image_time == -1)
         last_image_time = image_msg->header.stamp.toSec();
+    //若新到达的图像时间已超过上一帧图像时间1s或小于上一帧，则是新的图像序列
     else if (image_msg->header.stamp.toSec() - last_image_time > 1.0 || image_msg->header.stamp.toSec() < last_image_time)
     {
         ROS_WARN("image discontinue! detect a new sequence!");
@@ -113,6 +121,8 @@ void image_callback(const sensor_msgs::ImageConstPtr &image_msg)
 
 void point_callback(const sensor_msgs::PointCloudConstPtr &point_msg)
 {
+    //数据来源是vins_estimator下visualization.cpp的pubKeyframe()，这个函数是在estimator_node.cpp的主线程process()下调用的
+    //仍然是是滑窗内倒数第二帧的点。它首先扫描了滑窗内所有的点，如果某一个点在倒数第二帧前被看到，过了倒数第二帧仍然被看到，那么就把他的w系下的坐标，倒数第二帧的归一化坐标，像素坐标记录下来，发布出去。
     //ROS_INFO("point_callback!");
     if(!LOOP_CLOSURE)
         return;
@@ -133,10 +143,13 @@ void point_callback(const sensor_msgs::PointCloudConstPtr &point_msg)
 
 void pose_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
 {
+    //数据来源是vins_estimator下visualization.cpp的pubKeyframe()，这个函数是在estimator_node.cpp的主线程process()下调用的
+    //是滑窗内倒数第二帧的位姿！也就是说，pose_graph收到的数据，处理的对象，都是由estimator滑窗在各个时刻的倒数第二帧提供的
     //ROS_INFO("pose_callback!");
     if(!LOOP_CLOSURE)
         return;
     m_buf.lock();
+    //把位姿放到pose_buf里去，pose_buf会在process()里用到
     pose_buf.push(pose_msg);
     m_buf.unlock();
     /*
@@ -161,12 +174,15 @@ void imu_forward_callback(const nav_msgs::Odometry::ConstPtr &forward_msg)
         vio_q.y() = forward_msg->pose.pose.orientation.y;
         vio_q.z() = forward_msg->pose.pose.orientation.z;
 
+        //就是先用w_r_vio和w_t_vio矫正一次，再用r_drift和t_drift矫正一次。
+        //目前对他们的理解是前者是把当前位姿从错误的世界坐标系纠正到正确的坐标系上，后者是对短期位姿漂移的矫正。
         vio_t = posegraph.w_r_vio * vio_t + posegraph.w_t_vio;
         vio_q = posegraph.w_r_vio *  vio_q;
 
         vio_t = posegraph.r_drift * vio_t + posegraph.t_drift;
         vio_q = posegraph.r_drift * vio_q;
 
+        //然后把这个位姿从body->world变成cam->world：
         Vector3d vio_t_cam;
         Quaterniond vio_q_cam;
         vio_t_cam = vio_t + vio_q * tic;
@@ -175,8 +191,13 @@ void imu_forward_callback(const nav_msgs::Odometry::ConstPtr &forward_msg)
         cameraposevisual.reset();
         cameraposevisual.add_pose(vio_t_cam, vio_q_cam);
         cameraposevisual.publish_by(pub_camera_pose_visual, forward_msg->header);
-    }
+    }    
 }
+/**
+ * @brief //重定位回调函数，将重定位帧的相对位姿放入loop_info，updateKeyFrameLoop()进行回环更新
+ * 
+ * @param pose_msg 
+ */
 void relo_relative_pose_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
 {
     Vector3d relative_t = Vector3d(pose_msg->pose.pose.position.x,
@@ -200,6 +221,7 @@ void relo_relative_pose_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
 
 void vio_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
 {
+    //数据来源是vins_estimator下visualization.cpp的pubOdometry()，这个函数是在estimator_node.cpp的主线程process()下调用的，发布的位姿是滑窗的最新帧，假如说滑窗大小是10，那发布的是第11帧的位姿
     //ROS_INFO("vio_callback!");
     Vector3d vio_t(pose_msg->pose.pose.position.x, pose_msg->pose.pose.position.y, pose_msg->pose.pose.position.z);
     Quaterniond vio_q;
@@ -208,9 +230,12 @@ void vio_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
     vio_q.y() = pose_msg->pose.pose.orientation.y;
     vio_q.z() = pose_msg->pose.pose.orientation.z;
 
+    //类似于imu回调函数
+    //先根据重定位的结果进行矫正
     vio_t = posegraph.w_r_vio * vio_t + posegraph.w_t_vio;
     vio_q = posegraph.w_r_vio *  vio_q;
 
+    //再转化为cam->world的表示：
     vio_t = posegraph.r_drift * vio_t + posegraph.t_drift;
     vio_q = posegraph.r_drift * vio_q;
 
@@ -226,6 +251,7 @@ void vio_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
         cameraposevisual.publish_by(pub_camera_pose_visual, pose_msg->header);
     }
 
+    //把相机位姿的平移分类放到buffer里，这个buffer是为了给key_odometrys提供相机运动过程中一系列空间坐标数据的：
     odometry_buf.push(vio_t_cam);
     if (odometry_buf.size() > 10)
     {
@@ -258,6 +284,7 @@ void vio_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
         pose_marker.x = vio_t.x();
         pose_marker.y = vio_t.y();
         pose_marker.z = vio_t.z();
+        //而key_odometrys的作用在vins中也是用于可视化的
         key_odometrys.points.push_back(pose_marker);
         odometry_buf.push(vio_t);
     }
@@ -303,6 +330,8 @@ void process()
 
         // find out the messages with same time stamp
         m_buf.lock();
+        //首先经过时间戳的对比操作，在各个buffer里淘出具有相同时间戳的pose_msg、image_msg、point_msg ；
+        //然后控制频率，每隔SKIP_CNT帧进行一次，让CPU别那么累：
         if(!image_buf.empty() && !point_buf.empty() && !pose_buf.empty())
         {
             if (image_buf.front()->header.stamp.toSec() > pose_buf.front()->header.stamp.toSec())
@@ -346,7 +375,7 @@ void process()
                 skip_first_cnt++;
                 continue;
             }
-
+            //然后当前的关键帧相对上一个处理过的关键帧的平移也得大于一个距离，系统才会继续处理当前帧：
             if (skip_cnt < SKIP_CNT)
             {
                 skip_cnt++;
@@ -382,12 +411,14 @@ void process()
                                      pose_msg->pose.pose.orientation.x,
                                      pose_msg->pose.pose.orientation.y,
                                      pose_msg->pose.pose.orientation.z).toRotationMatrix();
+            //这些都满足了，那就把当前关键帧的点找出来：
             if((T - last_t).norm() > SKIP_DIS)
+            //将距上一关键帧距离（平移向量的模）超过SKIP_DIS的图像创建为关键帧
             {
-                vector<cv::Point3f> point_3d; 
-                vector<cv::Point2f> point_2d_uv; 
-                vector<cv::Point2f> point_2d_normal;
-                vector<double> point_id;
+                vector<cv::Point3f> point_3d; //世界坐标
+                vector<cv::Point2f> point_2d_uv;  //归一化平面坐标(关键帧所在坐标系)
+                vector<cv::Point2f> point_2d_normal;//像素坐标(关键帧所在坐标系)
+                vector<double> point_id; //点id(为啥是double？)
 
                 for (unsigned int i = 0; i < point_msg->points.size(); i++)
                 {
@@ -410,13 +441,15 @@ void process()
 
                     //printf("u %f, v %f \n", p_2d_uv.x, p_2d_uv.y);
                 }
-
+                //利用当前关键帧点，位姿，时间戳和当前关键帧在pose_graph里的idx构建一个关键帧：
                 KeyFrame* keyframe = new KeyFrame(pose_msg->header.stamp.toSec(), frame_index, T, R, image,
                                    point_3d, point_2d_uv, point_2d_normal, point_id, sequence);   
                 m_process.lock();
                 start_flag = 1;
+                //创建完关键帧之后，正戏开始了，往位姿图添加关键帧！
                 posegraph.addKeyFrame(keyframe, 1);
                 m_process.unlock();
+                //完事之后帧号+1：
                 frame_index++;
                 last_t = T;
             }
